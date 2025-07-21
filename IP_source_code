@@ -1,0 +1,210 @@
+import streamlit as st
+import numpy as np
+import serial
+import time
+import firebase_admin
+from firebase_admin import credentials, db
+import tensorflow as tf
+import os
+import matplotlib.pyplot as plt
+from streamlit_autorefresh import st_autorefresh
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet
+from datetime import datetime
+
+st_autorefresh(interval=5000, key="serial_data_refresh")
+st_autorefresh(interval=5000, key="ecg_data_refresh")
+
+SERIAL_PORT = "/dev/ttyUSB0" 
+BAUD_RATE = 115200
+
+# Connect to Serial Port
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    st.success(f"Connected to {SERIAL_PORT}")
+except Exception as e:
+    st.error(f"Failed to connect to serial port: {e}")
+    ser = None
+
+# Read Serial Data
+def read_serial_data():
+    if ser is None:
+        return None, None
+
+    bpm, spo2 = None, None
+    try:
+        line = ser.readline().decode("utf-8").strip()
+        if "BPM:" in line and "SpO2:" in line:
+            parts = line.replace("BPM:", "").replace("SpO2:", "").split(", ")
+            bpm = int(parts[0]) if parts[0] != "N/A" else None
+            spo2 = int(parts[1]) if parts[1] != "N/A" else None
+    except Exception as e:
+        st.error(f"Error reading serial data: {e}")
+    
+    return bpm, spo2
+
+# Calculate Blood Pressure (SBP & DBP)
+def calculate_sbp_dbp(bpm):
+    if bpm is None:
+        return None, None
+
+    sbp = np.round(1.5 * bpm + 90, 2)  
+    dbp = np.round(0.5 * bpm + 60, 2)  
+
+    return sbp, dbp
+
+# Initialize Firebase
+if not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate(os.getenv("FIREBASE_CREDENTIALS_PATH", "rt-ecg-12-firebase-adminsdk-fbsvc-a2f427dc4d.json"))
+        firebase_admin.initialize_app(cred, {
+            "databaseURL": "https://rt-ecg-12-default-rtdb.asia-southeast1.firebasedatabase.app"
+        })
+    except Exception as e:
+        st.error(f"Firebase initialization failed: {e}")
+
+USER_ID = "nHUTGVGOCIaa9MemnWn4AchbWGG2"
+
+# Clear Old ECG Data
+def clear_old_ecg_data():
+    try:
+        ref_path = f"/UsersData/{USER_ID}/ecgReadings"
+        ecg_readings = db.reference(ref_path).get()
+
+        if isinstance(ecg_readings, dict):
+            keys = sorted(map(int, ecg_readings.keys()))
+
+            if len(keys) > 2000:
+                for key in keys[:-1200]:
+                    db.reference(f"{ref_path}/{key}").delete()
+
+                st.info("Old ECG readings cleared from Firebase!")
+    except Exception as e:
+        st.error(f"Error clearing old ECG data: {e}")
+
+@st.cache_resource
+def load_model():
+    try:
+        MODEL_PATH = os.getenv("MODEL_PATH", "ecg_transformer.keras")
+        return tf.keras.models.load_model(MODEL_PATH)
+    except Exception as e:
+        st.error(f"Model loading failed: {e}")
+        return None
+
+model = load_model()
+
+# Fetch ECG Data from Firebase
+def fetch_latest_ecg():
+    try:
+        ref_path = f"/UsersData/{USER_ID}/ecgReadings"
+        ecg_readings = db.reference(ref_path).get()
+
+        if not ecg_readings:
+            return None
+
+        if isinstance(ecg_readings, dict):
+            keys = sorted(map(int, ecg_readings.keys()))
+            latest_key = keys[-1]
+            latest_ecg = ecg_readings[str(latest_key)].get("ecg", [])
+            return np.array(latest_ecg, dtype=np.float32) if latest_ecg else None
+        return None
+    except Exception as e:
+        st.error(f"Error fetching ECG data: {e}")
+        return None
+
+# Normalize ECG Data
+def normalize_ecg(ecg_signal):
+    return 2 * ((ecg_signal - np.min(ecg_signal)) / (np.max(ecg_signal) - np.min(ecg_signal))) - 1 if ecg_signal is not None else None
+
+# Preprocess ECG for Model
+def preprocess_ecg(ecg_signal):
+    if ecg_signal is None:
+        return None
+    ecg_signal = normalize_ecg(ecg_signal)
+    target_length = 100
+    ecg_signal = np.pad(ecg_signal, (0, target_length - len(ecg_signal)), 'constant') if len(ecg_signal) < target_length else ecg_signal[:target_length]
+    return np.expand_dims(ecg_signal, axis=(0, -1))
+
+# Classify ECG
+def classify_ecg(ecg_signal):
+    if ecg_signal is None or model is None:
+        return "No ECG data or model available"
+    prediction = model.predict(preprocess_ecg(ecg_signal))
+    return ["APC", "PVC", "Normal", "LBBB", "RBBB"][np.argmax(prediction)]
+
+st.title("Real-Time ECG & SpO2 Monitoring")
+
+bpm, spo2 = read_serial_data()
+if bpm is not None and spo2 is not None:
+    sbp, dbp = calculate_sbp_dbp(bpm)
+
+    st.subheader("Live Readings")
+    st.write(f"Heart Rate (BPM): {bpm}")
+    st.write(f"Oxygen Saturation (SpO2): {spo2}%")
+    st.write(f"Systolic BP (SBP): {sbp} mmHg")
+    st.write(f"Diastolic BP (DBP): {dbp} mmHg")
+else:
+    st.warning("Waiting for valid BPM/SpO2 data...")
+
+ecg_signal = fetch_latest_ecg()
+if ecg_signal is not None:
+    classification = classify_ecg(ecg_signal)
+
+    st.subheader("ECG Classification Result")
+    st.write(f"Arrhythmia Class: {classification}")
+
+    st.subheader("ECG Signal Plot")
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(ecg_signal, label="ECG Signal", color="blue")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("ECG Amplitude")
+    ax.set_title("Real-Time ECG Signal")
+    ax.legend()
+    ax.grid(True)
+    st.pyplot(fig)
+
+    clear_old_ecg_data()
+else:
+    st.warning("No ECG data found. Check Firebase connection.")
+
+# Save PDF
+if st.button("Save as PDF"):
+    try:
+        pdf_filename = "ecg_report.pdf"
+        doc = SimpleDocTemplate(pdf_filename, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+
+        title = Paragraph("<b>ECG Monitoring Report</b>", styles["Title"])
+        story.append(title)
+        story.append(Spacer(1, 12))
+
+        timestamp = Paragraph(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"])
+        story.append(timestamp)
+        story.append(Spacer(1, 24))
+
+        vitals_content = [
+            f"Heart Rate (BPM): {bpm if bpm else 'N/A'}",
+            f"Oxygen Saturation (SpO2): {spo2}%",
+            f"Systolic BP: {sbp} mmHg",
+            f"Diastolic BP: {dbp} mmHg"
+        ]
+        for item in vitals_content:
+            story.append(Paragraph(item, styles["Normal"]))
+            story.append(Spacer(1, 12))
+
+        classification_text = Paragraph(f"<b>ECG Classification:</b> {classification}", styles["Normal"])
+        story.append(classification_text)
+
+        doc.build(story)
+
+        st.success(f"PDF saved successfully as {pdf_filename} ✅")
+
+    except Exception as e:
+        st.error(f"Failed to generate PDF: {str(e)}")
+
+if ser:
+    ser.close()
